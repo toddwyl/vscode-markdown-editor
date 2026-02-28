@@ -10,6 +10,92 @@ function showError(msg: string) {
   vscode.window.showErrorMessage(`[markdown-editor] ${msg}`)
 }
 
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+async function handleAddToChat(
+  message: { text: string; before: string; after: string },
+  fileUri: vscode.Uri
+) {
+  const doc = await vscode.workspace.openTextDocument(fileUri)
+  const docText = doc.getText()
+  const { text, before, after } = message
+
+  let targetIndex = -1
+
+  // 策略1：上下文正则匹配
+  for (let ctxLen = Math.min(before.length, 80); ctxLen >= 10; ctxLen = Math.floor(ctxLen * 0.6)) {
+    const searchBefore = before.slice(-ctxLen)
+    const pattern = escapeRegex(searchBefore) + '[\\s\\S]{0,20}' + escapeRegex(text)
+    try {
+      const re = new RegExp(pattern)
+      const match = re.exec(docText)
+      if (match) {
+        const textIdx = match[0].lastIndexOf(text)
+        targetIndex = match.index + textIdx
+        break
+      }
+    } catch { }
+  }
+
+  // 策略2：直接搜索文本
+  if (targetIndex === -1) {
+    const firstIdx = docText.indexOf(text)
+    if (firstIdx !== -1) {
+      const secondIdx = docText.indexOf(text, firstIdx + 1)
+      if (secondIdx === -1) {
+        targetIndex = firstIdx
+      } else {
+        // 多处匹配，用比例偏移选最近的
+        const fullTextLen = (before + text + after).length
+        const ratio = before.length / Math.max(fullTextLen, 1)
+        const estimatedOffset = Math.floor(docText.length * ratio)
+
+        let bestIdx = firstIdx
+        let bestDist = Math.abs(firstIdx - estimatedOffset)
+        let idx = firstIdx
+        while (idx !== -1) {
+          const dist = Math.abs(idx - estimatedOffset)
+          if (dist < bestDist) {
+            bestDist = dist
+            bestIdx = idx
+          }
+          idx = docText.indexOf(text, idx + 1)
+        }
+        targetIndex = bestIdx
+      }
+    }
+  }
+
+  if (targetIndex === -1) {
+    await vscode.env.clipboard.writeText(text)
+    vscode.window.showInformationMessage('Selection copied to clipboard. Use Cmd+V to paste in chat.')
+    return
+  }
+
+  // 打开文本编辑器并选中
+  const startPos = doc.positionAt(targetIndex)
+  const endPos = doc.positionAt(targetIndex + text.length)
+  await vscode.window.showTextDocument(doc, {
+    viewColumn: vscode.ViewColumn.Beside,
+    preserveFocus: false,
+    selection: new vscode.Range(startPos, endPos),
+  })
+
+  // 触发 Cursor 的 add-to-chat 命令
+  try {
+    await vscode.commands.executeCommand('aichat.newchataction')
+  } catch {
+    try {
+      await vscode.commands.executeCommand('cursorAiChat.addToChat')
+    } catch {
+      await vscode.env.clipboard.writeText(text)
+      vscode.window.showInformationMessage('Selection copied. Use Cmd+V to paste in chat.')
+    }
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   // Register original command (used by context menu/shortcuts)
   context.subscriptions.push(
@@ -292,6 +378,10 @@ class EditorPanel {
             vscode.commands.executeCommand('vscode.open', vscode.Uri.parse(url))
             break
           }
+          case 'add-to-chat': {
+            await handleAddToChat(message, this._uri)
+            break
+          }
         }
       },
       null,
@@ -558,6 +648,10 @@ class MarkdownEditorProvider implements vscode.CustomTextEditorProvider {
             url = NodePath.resolve(uri.fsPath, '..', url)
           }
           vscode.commands.executeCommand('vscode.open', vscode.Uri.parse(url))
+          break
+        }
+        case 'add-to-chat': {
+          await handleAddToChat(message, uri)
           break
         }
       }

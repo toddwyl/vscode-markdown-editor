@@ -145,4 +145,51 @@ window.addEventListener('message', (e) => {
 fixLinkClick()
 fixCut()
 
+// 拦截 Command+L，将选区信息发送给 extension
+document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'l') {
+    const selection = window.getSelection();
+    const selectedText = selection?.toString();
+    if (!selectedText) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    try {
+      const range = selection.getRangeAt(0);
+      const editorEl = document.querySelector('.vditor-ir .vditor-reset')
+        || document.querySelector('.vditor-sv .vditor-reset')
+        || document.querySelector('.vditor-wysiwyg .vditor-reset');
+
+      let before = '';
+      let after = '';
+      if (editorEl) {
+        const preRange = document.createRange();
+        preRange.setStart(editorEl, 0);
+        preRange.setEnd(range.startContainer, range.startOffset);
+        before = preRange.toString().slice(-80);
+
+        const postRange = document.createRange();
+        postRange.setStart(range.endContainer, range.endOffset);
+        postRange.setEnd(editorEl, editorEl.childNodes.length);
+        after = postRange.toString().slice(0, 80);
+      }
+
+      vscode.postMessage({
+        command: 'add-to-chat',
+        text: selectedText,
+        before,
+        after,
+      });
+    } catch (err) {
+      vscode.postMessage({
+        command: 'add-to-chat',
+        text: selectedText,
+        before: '',
+        after: '',
+      });
+    }
+  }
+});
+
 vscode.postMessage({ command: 'ready' })
