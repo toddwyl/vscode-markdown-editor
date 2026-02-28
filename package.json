@@ -1,10 +1,10 @@
 {
-  "name": "markdown-editor",
-  "displayName": "Markdown Editor",
+  "name": "markdown-editor-plus",
+  "displayName": "Markdown Editor Plus",
   "icon": "media/logo.png",
-  "description": "A full-featured WYSIWYG editor for markdown.",
-  "version": "0.1.14",
-  "publisher": "zaaack",
+  "description": "A full-featured WYSIWYG editor for markdown with Cursor chat integration.",
+  "version": "0.1.15",
+  "publisher": "toddwyl",
   "private": true,
   "engines": {
     "vscode": "^1.47.0"

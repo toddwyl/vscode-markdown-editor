@@ -14,85 +14,242 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/**
+ * Strip markdown to plain text, returning both the plain text and a position map
+ * that maps each plain text index back to the original markdown index.
+ */
+function stripMarkdownWithMap(md: string): { plain: string; map: number[] } {
+  // Build a char-by-char map: for each character in output, record its original index
+  // We process the markdown and track which original chars survive
+
+  // First, do line-by-line processing to handle block-level syntax
+  const lines = md.split('\n')
+  let result = ''
+  const map: number[] = []
+  let offset = 0 // current offset in original md
+
+  for (let li = 0; li < lines.length; li++) {
+    let line = lines[li]
+    const lineStart = offset
+
+    // Skip fenced code block markers (``` ... ```)
+    if (/^```/.test(line)) {
+      offset += line.length + 1 // +1 for \n
+      continue
+    }
+
+    // Strip ATX headers: ### Header -> Header
+    const headerMatch = line.match(/^(\s*#{1,6}\s+)/)
+    let lineOffset = 0
+    if (headerMatch) {
+      lineOffset = headerMatch[1].length
+    }
+
+    // Strip blockquote markers: > text -> text
+    const bqMatch = line.slice(lineOffset).match(/^(\s*>\s*)/)
+    if (bqMatch) {
+      lineOffset += bqMatch[1].length
+    }
+
+    // Strip list markers: - item, * item, 1. item
+    const listMatch = line.slice(lineOffset).match(/^(\s*(?:[\*\-\+]|\d+\.)\s+)/)
+    if (listMatch) {
+      lineOffset += listMatch[1].length
+    }
+
+    // Now process inline markdown in the remaining line
+    const inlinePart = line.slice(lineOffset)
+    const inlineStart = lineStart + lineOffset
+
+    for (let i = 0; i < inlinePart.length; i++) {
+      const ch = inlinePart[i]
+      const origIdx = inlineStart + i
+
+      // Skip inline markdown markers
+      // Bold/italic: ** __ * _
+      if ((ch === '*' || ch === '_')) {
+        // Check for ** or __
+        if (i + 1 < inlinePart.length && inlinePart[i + 1] === ch) {
+          i++ // skip both
+          continue
+        }
+        // Single * or _ at word boundary - skip
+        continue
+      }
+
+      // Strikethrough ~~
+      if (ch === '~' && i + 1 < inlinePart.length && inlinePart[i + 1] === '~') {
+        i++
+        continue
+      }
+
+      // Inline code `
+      if (ch === '`') {
+        continue
+      }
+
+      // Images ![alt](url) - skip the ![, keep alt, skip ](url)
+      if (ch === '!' && i + 1 < inlinePart.length && inlinePart[i + 1] === '[') {
+        // Find closing ]
+        const closeBracket = inlinePart.indexOf(']', i + 2)
+        if (closeBracket !== -1) {
+          // Output alt text
+          for (let j = i + 2; j < closeBracket; j++) {
+            result += inlinePart[j]
+            map.push(inlineStart + j)
+          }
+          // Skip ](url) or ][ref]
+          if (closeBracket + 1 < inlinePart.length && (inlinePart[closeBracket + 1] === '(' || inlinePart[closeBracket + 1] === '[')) {
+            const closeChar = inlinePart[closeBracket + 1] === '(' ? ')' : ']'
+            const endIdx = inlinePart.indexOf(closeChar, closeBracket + 2)
+            i = endIdx !== -1 ? endIdx : closeBracket
+          } else {
+            i = closeBracket
+          }
+          continue
+        }
+      }
+
+      // Links [text](url) - keep text, skip (url)
+      if (ch === '[') {
+        const closeBracket = inlinePart.indexOf(']', i + 1)
+        if (closeBracket !== -1 && closeBracket + 1 < inlinePart.length && (inlinePart[closeBracket + 1] === '(' || inlinePart[closeBracket + 1] === '[')) {
+          // Output link text
+          for (let j = i + 1; j < closeBracket; j++) {
+            result += inlinePart[j]
+            map.push(inlineStart + j)
+          }
+          // Skip ](url)
+          const closeChar = inlinePart[closeBracket + 1] === '(' ? ')' : ']'
+          const endIdx = inlinePart.indexOf(closeChar, closeBracket + 2)
+          i = endIdx !== -1 ? endIdx : closeBracket
+          continue
+        }
+      }
+
+      // HTML tags
+      if (ch === '<' && /^<[^>]+>/.test(inlinePart.slice(i))) {
+        const tagEnd = inlinePart.indexOf('>', i)
+        if (tagEnd !== -1) {
+          i = tagEnd
+          continue
+        }
+      }
+
+      result += ch
+      map.push(origIdx)
+    }
+
+    // Add newline
+    result += '\n'
+    map.push(lineStart + line.length) // map newline to original newline position
+
+    offset += line.length + 1 // +1 for \n
+  }
+
+  return { plain: result, map }
+}
+
 async function handleAddToChat(
   message: { text: string; before: string; after: string },
   fileUri: vscode.Uri
 ) {
+  const outputChannel = vscode.window.createOutputChannel('Markdown Editor Debug')
+  const log = (msg: string, ...args: any[]) => {
+    const line = `[add-to-chat] ${msg} ${args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ')}`
+    outputChannel.appendLine(line)
+  }
+
+  log('handleAddToChat called, textLen=' + message.text.length)
+
   const doc = await vscode.workspace.openTextDocument(fileUri)
   const docText = doc.getText()
   const { text, before, after } = message
 
-  let targetIndex = -1
+  let targetStart = -1
+  let targetEnd = -1
+  let matchStrategy = 'none'
 
-  // 策略1：上下文正则匹配
-  for (let ctxLen = Math.min(before.length, 80); ctxLen >= 10; ctxLen = Math.floor(ctxLen * 0.6)) {
-    const searchBefore = before.slice(-ctxLen)
-    const pattern = escapeRegex(searchBefore) + '[\\s\\S]{0,20}' + escapeRegex(text)
-    try {
-      const re = new RegExp(pattern)
-      const match = re.exec(docText)
-      if (match) {
-        const textIdx = match[0].lastIndexOf(text)
-        targetIndex = match.index + textIdx
-        break
-      }
-    } catch { }
-  }
-
-  // 策略2：直接搜索文本
-  if (targetIndex === -1) {
+  // 策略1：直接搜索（文本完全一致）
+  {
     const firstIdx = docText.indexOf(text)
     if (firstIdx !== -1) {
-      const secondIdx = docText.indexOf(text, firstIdx + 1)
-      if (secondIdx === -1) {
-        targetIndex = firstIdx
-      } else {
-        // 多处匹配，用比例偏移选最近的
-        const fullTextLen = (before + text + after).length
-        const ratio = before.length / Math.max(fullTextLen, 1)
-        const estimatedOffset = Math.floor(docText.length * ratio)
+      targetStart = firstIdx
+      targetEnd = firstIdx + text.length
+      matchStrategy = 'exact'
+    }
+  }
 
-        let bestIdx = firstIdx
-        let bestDist = Math.abs(firstIdx - estimatedOffset)
-        let idx = firstIdx
-        while (idx !== -1) {
-          const dist = Math.abs(idx - estimatedOffset)
-          if (dist < bestDist) {
-            bestDist = dist
-            bestIdx = idx
+  // 策略2：strip markdown 后匹配，再映射回原始位置
+  if (targetStart === -1) {
+    const { plain, map: posMap } = stripMarkdownWithMap(docText)
+    const plainIdx = plain.indexOf(text)
+
+    if (plainIdx !== -1) {
+      targetStart = posMap[plainIdx]
+      targetEnd = posMap[Math.min(plainIdx + text.length - 1, posMap.length - 1)] + 1
+      matchStrategy = 'strip-match'
+    } else {
+      // 策略2b：按行匹配
+      const selectedLines = text.split('\n').filter(l => l.trim().length > 0)
+      if (selectedLines.length > 0) {
+        const firstLine = selectedLines[0].trim()
+        const firstLineIdx = plain.indexOf(firstLine)
+        if (firstLineIdx !== -1) {
+          const lastLine = selectedLines[selectedLines.length - 1].trim()
+          const lastLineIdx = plain.indexOf(lastLine, firstLineIdx)
+          if (lastLineIdx !== -1) {
+            targetStart = posMap[firstLineIdx]
+            const lastEnd = lastLineIdx + lastLine.length - 1
+            targetEnd = posMap[Math.min(lastEnd, posMap.length - 1)] + 1
+            matchStrategy = 'line-match'
           }
-          idx = docText.indexOf(text, idx + 1)
         }
-        targetIndex = bestIdx
+      }
+    }
+
+    // 策略2c：用上下文辅助定位
+    if (targetStart === -1 && before.length > 0) {
+      const ctxSearch = before.slice(-30) + text.slice(0, 30)
+      const ctxIdx = plain.indexOf(ctxSearch)
+      if (ctxIdx !== -1) {
+        const textStartInPlain = ctxIdx + before.slice(-30).length
+        targetStart = posMap[textStartInPlain]
+        const textEndInPlain = Math.min(textStartInPlain + text.length - 1, posMap.length - 1)
+        targetEnd = posMap[textEndInPlain] + 1
+        matchStrategy = 'context-plain'
       }
     }
   }
 
-  if (targetIndex === -1) {
+  log(`match: strategy=${matchStrategy}, start=${targetStart}, end=${targetEnd}`)
+
+  if (targetStart === -1) {
+    log('fallback: clipboard')
     await vscode.env.clipboard.writeText(text)
-    vscode.window.showInformationMessage('Selection copied to clipboard. Use Cmd+V to paste in chat.')
     return
   }
 
   // 打开文本编辑器并选中
-  const startPos = doc.positionAt(targetIndex)
-  const endPos = doc.positionAt(targetIndex + text.length)
+  const startPos = doc.positionAt(targetStart)
+  const endPos = doc.positionAt(targetEnd)
+
   await vscode.window.showTextDocument(doc, {
-    viewColumn: vscode.ViewColumn.Beside,
+    viewColumn: vscode.ViewColumn.Active,
     preserveFocus: false,
     selection: new vscode.Range(startPos, endPos),
   })
 
-  // 触发 Cursor 的 add-to-chat 命令
+  // 等待编辑器完全激活
+  await new Promise(resolve => setTimeout(resolve, 200))
+
+  // 触发 Cursor 的 Cmd+L (add to chat) 命令
   try {
     await vscode.commands.executeCommand('aichat.newchataction')
-  } catch {
-    try {
-      await vscode.commands.executeCommand('cursorAiChat.addToChat')
-    } catch {
-      await vscode.env.clipboard.writeText(text)
-      vscode.window.showInformationMessage('Selection copied. Use Cmd+V to paste in chat.')
-    }
+    log('aichat.newchataction succeeded')
+  } catch (e) {
+    log('aichat.newchataction failed: ' + String(e))
+    await vscode.env.clipboard.writeText(text)
   }
 }
 

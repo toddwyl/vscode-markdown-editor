@@ -145,7 +145,7 @@ window.addEventListener('message', (e) => {
 fixLinkClick()
 fixCut()
 
-// 拦截 Command+L，将选区信息发送给 extension
+// 拦截 Command+L，将选区信息发送给 extension (Cursor chat)
 document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'l') {
     const selection = window.getSelection();
@@ -153,7 +153,7 @@ document.addEventListener('keydown', (e) => {
     if (!selectedText) return;
 
     e.preventDefault();
-    e.stopPropagation();
+    e.stopImmediatePropagation();
 
     try {
       const range = selection.getRangeAt(0);
@@ -190,6 +190,6 @@ document.addEventListener('keydown', (e) => {
       });
     }
   }
-});
+}, true);
 
 vscode.postMessage({ command: 'ready' })
